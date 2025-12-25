@@ -1,0 +1,32 @@
+Thu Dec 25 11:53:55 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 591.59                 Driver Version: 591.59         CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce GTX 1650 ...  WDDM  |   00000000:0C:00.0 Off |                  N/A |
+| 20%   30C    P8              8W /  100W |    2483MiB /   4096MiB |     11%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            1684    C+G   ...y\StartMenuExperienceHost.exe      N/A      |
+|    0   N/A  N/A            2084    C+G   ...t\Edge\Application\msedge.exe      N/A      |
+|    0   N/A  N/A            3240    C+G   C:\Windows\System32\dwm.exe           N/A      |
+|    0   N/A  N/A            3700    C+G   C:\Windows\explorer.exe               N/A      |
+|    0   N/A  N/A            4416    C+G   ....0.3650.96\msedgewebview2.exe      N/A      |
+|    0   N/A  N/A            4576    C+G   C:\Windows\System32\WUDFHost.exe      N/A      |
+|    0   N/A  N/A           12380      C   C:\Python312\python.exe               N/A      |
+|    0   N/A  N/A           12792    C+G   ..._cw5n1h2txyewy\SearchHost.exe      N/A      |
+|    0   N/A  N/A           14392    C+G   C:\Windows\System32\LogonUI.exe       N/A      |
+|    0   N/A  N/A           14456    C+G   ...5atnkzcwy\mcafee-security.exe      N/A      |
+|    0   N/A  N/A           14484    C+G   C:\Windows\System32\dwm.exe           N/A      |
+|    0   N/A  N/A           17052    C+G   ...indows\System32\ShellHost.exe      N/A      |
+|    0   N/A  N/A           18744    C+G   ...2txyewy\CrossDeviceResume.exe      N/A      |
++-----------------------------------------------------------------------------------------+
