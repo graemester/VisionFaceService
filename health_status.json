@@ -1,0 +1,22 @@
+{
+  "timestamp": "2025-12-26T22:54:12.535362",
+  "status": "running",
+  "processed_count": 0,
+  "face_count": 0,
+  "failure_count": 5,
+  "has_failure_table": true,
+  "uptime_seconds": 99.821647,
+  "circuit_breaker": {
+    "is_open": false,
+    "consecutive_failures": 5,
+    "batch_count": 1,
+    "trip_count": 0,
+    "last_trip_time": null
+  },
+  "blacklist": {
+    "blacklisted_count": 0,
+    "tracked_count": 5,
+    "blacklisted_paths": []
+  },
+  "executor_restarts": 2
+}

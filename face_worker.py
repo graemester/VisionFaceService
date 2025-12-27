@@ -67,9 +67,27 @@ MAX_RETRY_DELAY_SECONDS = 3600      # 1 hour max
 # GPU Memory Threshold (MiB) - don't start if less than this available
 MIN_GPU_MEMORY_MIB = 1500
 
-# Paths
+# Circuit Breaker Settings
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 0.8  # 80% failure rate triggers pause
+CIRCUIT_BREAKER_WINDOW_SIZE = 5          # Number of batches to track
+CIRCUIT_BREAKER_PAUSE_SECONDS = 300      # 5 minutes pause when triggered
+CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 10  # Pause after 10 consecutive failures
+
+# In-Memory Blacklist (for session)
+SESSION_BLACKLIST_MAX_FAILURES = 3       # Blacklist after 3 failures in same session
+SESSION_BLACKLIST_DURATION_SECONDS = 3600  # 1 hour blacklist
+
+# Executor Recovery
+EXECUTOR_MAX_CONSECUTIVE_CRASHES = 5     # Restart executor after 5 crashes
+EXECUTOR_RESTART_DELAY_SECONDS = 10      # Wait before restarting
+
+# Paths (defined early for use in other constants)
 WORKER_DIR = Path(r"C:\VisionFaceService")
 PID_FILE = WORKER_DIR / "worker.pid"
+
+# Health Monitoring
+HEALTH_STATUS_FILE = WORKER_DIR / "health_status.json"
+METRICS_FILE = WORKER_DIR / "metrics.json"
 LOG_FILE = WORKER_DIR / "worker.log"
 NVIDIA_SMI = Path(r"C:\Windows\System32\nvidia-smi.exe")
 
@@ -149,6 +167,210 @@ def check_gpu_ready() -> bool:
 
     logger.info(f"GPU memory OK: {info['free']}MiB free of {info['total']}MiB")
     return True
+
+
+# ============================================================
+# CIRCUIT BREAKER & AUTO-HEALING
+# ============================================================
+
+class CircuitBreaker:
+    """Tracks failure rates and triggers pauses when thresholds are exceeded."""
+
+    def __init__(
+        self,
+        failure_threshold: float = CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+        window_size: int = CIRCUIT_BREAKER_WINDOW_SIZE,
+        pause_seconds: int = CIRCUIT_BREAKER_PAUSE_SECONDS,
+        max_consecutive: int = CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
+    ):
+        self.failure_threshold = failure_threshold
+        self.window_size = window_size
+        self.pause_seconds = pause_seconds
+        self.max_consecutive = max_consecutive
+        self.batch_results: List[Tuple[int, int]] = []  # (successes, failures)
+        self.consecutive_failures = 0
+        self.is_open = False
+        self.last_trip_time: Optional[datetime] = None
+        self.trip_count = 0
+
+    def record_batch(self, successes: int, failures: int):
+        """Record batch results and check if circuit should trip."""
+        self.batch_results.append((successes, failures))
+
+        # Keep only last window_size batches
+        if len(self.batch_results) > self.window_size:
+            self.batch_results.pop(0)
+
+        # Track consecutive failures
+        if failures > 0 and successes == 0:
+            self.consecutive_failures += failures
+        else:
+            self.consecutive_failures = 0
+
+        # Check if we should trip
+        self._check_trip()
+
+    def _check_trip(self):
+        """Check if circuit breaker should trip."""
+        if len(self.batch_results) < self.window_size:
+            return
+
+        total_successes = sum(s for s, f in self.batch_results)
+        total_failures = sum(f for s, f in self.batch_results)
+        total = total_successes + total_failures
+
+        if total == 0:
+            return
+
+        failure_rate = total_failures / total
+
+        if failure_rate >= self.failure_threshold:
+            self._trip(f"Failure rate {failure_rate:.1%} exceeds threshold {self.failure_threshold:.1%}")
+        elif self.consecutive_failures >= self.max_consecutive:
+            self._trip(f"Consecutive failures ({self.consecutive_failures}) exceeds threshold")
+
+    def _trip(self, reason: str):
+        """Trip the circuit breaker."""
+        self.is_open = True
+        self.last_trip_time = datetime.now()
+        self.trip_count += 1
+        logger.warning(f"CIRCUIT BREAKER TRIPPED (#{self.trip_count}): {reason}")
+        logger.warning(f"Pausing for {self.pause_seconds} seconds...")
+
+    def can_proceed(self) -> bool:
+        """Check if processing can proceed."""
+        if not self.is_open:
+            return True
+
+        elapsed = (datetime.now() - self.last_trip_time).total_seconds()
+        if elapsed >= self.pause_seconds:
+            self._reset()
+            return True
+
+        return False
+
+    def _reset(self):
+        """Reset the circuit breaker."""
+        self.is_open = False
+        self.batch_results.clear()
+        self.consecutive_failures = 0
+        logger.info("Circuit breaker reset - resuming processing")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current circuit breaker status."""
+        return {
+            "is_open": self.is_open,
+            "consecutive_failures": self.consecutive_failures,
+            "batch_count": len(self.batch_results),
+            "trip_count": self.trip_count,
+            "last_trip_time": self.last_trip_time.isoformat() if self.last_trip_time else None,
+        }
+
+
+class SessionBlacklist:
+    """In-memory blacklist for images that fail repeatedly in the same session."""
+
+    def __init__(
+        self,
+        max_failures: int = SESSION_BLACKLIST_MAX_FAILURES,
+        duration_seconds: int = SESSION_BLACKLIST_DURATION_SECONDS
+    ):
+        self.max_failures = max_failures
+        self.duration_seconds = duration_seconds
+        self.failure_counts: Dict[str, int] = {}  # image_path -> failure count
+        self.blacklist: Dict[str, datetime] = {}  # image_path -> blacklist_until
+
+    def record_failure(self, image_path: str) -> bool:
+        """Record a failure. Returns True if image is now blacklisted."""
+        self.failure_counts[image_path] = self.failure_counts.get(image_path, 0) + 1
+
+        if self.failure_counts[image_path] >= self.max_failures:
+            self.blacklist[image_path] = datetime.now() + timedelta(seconds=self.duration_seconds)
+            logger.warning(f"Image blacklisted for session: {image_path} "
+                         f"(failed {self.failure_counts[image_path]} times)")
+            return True
+        return False
+
+    def is_blacklisted(self, image_path: str) -> bool:
+        """Check if image is currently blacklisted."""
+        if image_path not in self.blacklist:
+            return False
+
+        if datetime.now() >= self.blacklist[image_path]:
+            # Blacklist expired
+            del self.blacklist[image_path]
+            self.failure_counts.pop(image_path, None)
+            return False
+
+        return True
+
+    def clear_on_success(self, image_path: str):
+        """Clear failure count when an image succeeds."""
+        self.failure_counts.pop(image_path, None)
+        self.blacklist.pop(image_path, None)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get blacklist statistics."""
+        return {
+            "blacklisted_count": len(self.blacklist),
+            "tracked_count": len(self.failure_counts),
+            "blacklisted_paths": list(self.blacklist.keys())[:10],  # Sample
+        }
+
+
+class ExecutorManager:
+    """Manages ProcessPoolExecutor with automatic recovery."""
+
+    def __init__(self, max_crashes: int = EXECUTOR_MAX_CONSECUTIVE_CRASHES):
+        self.max_crashes = max_crashes
+        self.consecutive_crashes = 0
+        self.executor: Optional[ProcessPoolExecutor] = None
+        self.total_restarts = 0
+
+    def create_executor(self) -> ProcessPoolExecutor:
+        """Create a new executor."""
+        if self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+        self.executor = ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=init_face_worker
+        )
+        self.total_restarts += 1
+        logger.info(f"Created new ProcessPoolExecutor (restart #{self.total_restarts})")
+        return self.executor
+
+    def record_success(self):
+        """Record successful execution."""
+        self.consecutive_crashes = 0
+
+    def record_crash(self) -> bool:
+        """Record a crash. Returns True if executor should be restarted."""
+        self.consecutive_crashes += 1
+
+        if self.consecutive_crashes >= self.max_crashes:
+            logger.warning(f"Executor has crashed {self.consecutive_crashes} times - will restart")
+            self.consecutive_crashes = 0
+            return True
+        return False
+
+    def get_executor(self) -> ProcessPoolExecutor:
+        """Get current executor, creating one if needed."""
+        if self.executor is None:
+            return self.create_executor()
+        return self.executor
+
+    def shutdown(self):
+        """Shutdown executor."""
+        if self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self.executor = None
 
 
 # ============================================================
@@ -347,13 +569,20 @@ def detect_faces_cascade(image_path: str) -> Dict[str, Any]:
             "error": "File not found",
             "error_type": "file_error",
             "face_count": 0,
+            "original_size": None,
+            "file_size": 0,
+            "attempted_scale": None,
         }
     except Exception as e:
+        import traceback
         return {
             "success": False,
-            "error": str(e),
+            "error": f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}",
             "error_type": "file_error",
             "face_count": 0,
+            "original_size": original_size,
+            "file_size": file_size,
+            "attempted_scale": None,
         }
 
     # Try each scale in the cascade
@@ -369,10 +598,29 @@ def detect_faces_cascade(image_path: str) -> Dict[str, Any]:
                 target_scale=scale
             )
 
+            # DEFENSIVE: Check image_array is valid
+            if image_array is None:
+                last_error = f"Preprocessing returned None at scale {scale}"
+                last_error_type = "file_error"
+                continue
+
+            # DEFENSIVE: Check dimensions
+            if image_array.ndim < 2:
+                last_error = f"Invalid image dimensions: ndim={image_array.ndim}"
+                last_error_type = "file_error"
+                continue
+
             # Check minimum size
             h, w = image_array.shape[:2]
+            if h == 0 or w == 0:
+                last_error = f"Zero dimension image: {image_array.shape}"
+                last_error_type = "file_error"
+                continue
+
             if min(h, w) < MIN_FACE_SIZE * 2:
-                # Image too small at this scale
+                # Image too small at this scale - set error for tracking
+                last_error = f"Image too small at scale {scale}: {w}x{h} (min {MIN_FACE_SIZE * 2}px needed)"
+                last_error_type = "too_small"
                 continue
 
             # Try CNN model first (GPU accelerated)
@@ -382,6 +630,11 @@ def detect_faces_cascade(image_path: str) -> Dict[str, Any]:
                     model="cnn",
                     number_of_times_to_upsample=CNN_UPSAMPLE_TIMES
                 )
+
+                # DEFENSIVE: face_locations should never be None
+                if face_locations is None:
+                    face_locations = []
+
                 model_used = "cnn"
             except RuntimeError as e:
                 error_str = str(e).lower()
@@ -505,44 +758,81 @@ def detect_faces_cascade(image_path: str) -> Dict[str, Any]:
 # ============================================================
 
 class FaceWorker:
-    """Hardened face detection worker."""
+    """Hardened face detection worker with auto-healing."""
 
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
-        self.executor: Optional[ProcessPoolExecutor] = None
         self.running = True
         self.processed_count = 0
         self.face_count = 0
         self.failure_count = 0
         self.has_failure_table = False
+        self.start_time = datetime.now()
+
+        # Auto-healing components
+        self.circuit_breaker = CircuitBreaker()
+        self.session_blacklist = SessionBlacklist()
+        self.executor_manager = ExecutorManager()
+
+    @property
+    def executor(self) -> Optional[ProcessPoolExecutor]:
+        """Get executor from manager for backward compatibility."""
+        return self.executor_manager.executor if hasattr(self, 'executor_manager') else None
 
     async def connect(self):
-        """Connect to PostgreSQL and check table access."""
+        """Connect to PostgreSQL and ensure failure table exists."""
         dsn = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
         self.pool = await asyncpg.create_pool(dsn, min_size=2, max_size=5)
         logger.info(f"Connected to PostgreSQL at {DB_HOST}")
 
-        # Check if we have access to failure tracking table
+        # Try to create failure tracking table if it doesn't exist
         async with self.pool.acquire() as conn:
+            # First try to create the table
+            try:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS face_detection_failures (
+                        id SERIAL PRIMARY KEY,
+                        image_path TEXT NOT NULL UNIQUE,
+                        retry_count INTEGER DEFAULT 0,
+                        last_error TEXT,
+                        last_error_type TEXT,
+                        original_width INTEGER,
+                        original_height INTEGER,
+                        file_size_bytes BIGINT,
+                        last_attempted_scale REAL,
+                        first_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_failure_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        next_retry_after TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        permanently_failed BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                logger.info("Ensured face_detection_failures table exists")
+            except asyncpg.exceptions.InsufficientPrivilegeError:
+                logger.warning("Cannot create face_detection_failures table - insufficient privileges")
+            except Exception as e:
+                logger.warning(f"Could not create failure table: {e}")
+
+            # Now check if we have access
             try:
                 await conn.fetchval("SELECT 1 FROM face_detection_failures LIMIT 1")
                 self.has_failure_table = True
-                logger.info("Failure tracking table available")
+                logger.info("Failure tracking table available and accessible")
             except asyncpg.exceptions.InsufficientPrivilegeError:
                 self.has_failure_table = False
-                logger.warning("No access to face_detection_failures table - "
-                             "failures will be logged but not tracked for retry")
+                logger.error("No access to face_detection_failures table - "
+                           "failures will be logged but not tracked for retry. "
+                           "Run: GRANT ALL ON face_detection_failures TO vision;")
             except asyncpg.exceptions.UndefinedTableError:
                 self.has_failure_table = False
-                logger.warning("face_detection_failures table does not exist")
+                logger.error("face_detection_failures table does not exist and cannot be created")
 
     async def disconnect(self):
         """Clean shutdown."""
         self.running = False
         if self.pool:
             await self.pool.close()
-        if self.executor:
-            self.executor.shutdown(wait=False, cancel_futures=True)
+        if hasattr(self, 'executor_manager'):
+            self.executor_manager.shutdown()
 
     async def get_pending_images(self, batch_size: int) -> List[Dict]:
         """Get images needing face detection, including retriable failures."""
@@ -632,15 +922,16 @@ class FaceWorker:
         async with self.pool.acquire() as conn:
             try:
                 # Calculate next retry delay with exponential backoff
+                # Note: file_size_bytes column removed as it doesn't exist in production table
                 await conn.execute("""
                     INSERT INTO face_detection_failures
                         (image_path, last_error, last_error_type,
-                         original_width, original_height, file_size_bytes,
+                         original_width, original_height,
                          last_attempted_scale, retry_count,
                          first_failure_at, last_failure_at, next_retry_after)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
+                    VALUES ($1, $2, $3, $4, $5, $6, 1,
                             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
-                            CURRENT_TIMESTAMP + INTERVAL '1 second' * $8)
+                            CURRENT_TIMESTAMP + INTERVAL '1 second' * $7)
                     ON CONFLICT (image_path) DO UPDATE SET
                         retry_count = face_detection_failures.retry_count + 1,
                         last_error = EXCLUDED.last_error,
@@ -648,15 +939,14 @@ class FaceWorker:
                         last_attempted_scale = EXCLUDED.last_attempted_scale,
                         last_failure_at = CURRENT_TIMESTAMP,
                         next_retry_after = CURRENT_TIMESTAMP + INTERVAL '1 second' *
-                            LEAST($8 * POWER($9, face_detection_failures.retry_count), $10),
-                        permanently_failed = (face_detection_failures.retry_count >= $11)
+                            LEAST($7 * POWER($8, face_detection_failures.retry_count), $9),
+                        permanently_failed = (face_detection_failures.retry_count + 1 >= $10)
                 """,
                     image_path,
                     error[:500] if error else None,  # Truncate long errors
                     error_type,
                     original_size[0] if original_size else None,
                     original_size[1] if original_size else None,
-                    file_size,
                     attempted_scale,
                     BASE_RETRY_DELAY_SECONDS,
                     RETRY_BACKOFF_MULTIPLIER,
@@ -665,17 +955,42 @@ class FaceWorker:
                 )
             except Exception as e:
                 logger.error(f"Failed to record failure for {image_path}: {e}")
+                raise  # Re-raise so caller can handle
+
+    async def _force_permanent_failure(self, image_path: str, reason: str):
+        """Last-resort method to permanently fail an image and break retry loops."""
+        if not self.has_failure_table:
+            logger.error(f"Cannot force-fail {image_path}: no failure table")
+            return
+
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO face_detection_failures
+                        (image_path, last_error, last_error_type, permanently_failed,
+                         retry_count, next_retry_after)
+                    VALUES ($1, $2, 'forced_permanent', TRUE, 99,
+                            CURRENT_TIMESTAMP + INTERVAL '100 years')
+                    ON CONFLICT (image_path) DO UPDATE SET
+                        permanently_failed = TRUE,
+                        last_error = EXCLUDED.last_error,
+                        last_error_type = 'forced_permanent',
+                        next_retry_after = CURRENT_TIMESTAMP + INTERVAL '100 years'
+                """, image_path, reason[:500])
+                logger.warning(f"Force-permanent failure: {image_path}")
+        except Exception as e:
+            logger.error(f"Even force_permanent_failure failed for {image_path}: {e}")
 
     async def process_image(self, image_info: Dict) -> Tuple[bool, int]:
         """Process a single image for face detection."""
         linux_path = image_info['file_path']
         windows_path = linux_to_windows_path(linux_path)
 
-        # Check file exists
+        # Check file exists - missing files should be IMMEDIATELY permanent (no retry)
         if not os.path.exists(windows_path):
-            logger.warning(f"File not found: {windows_path}")
-            await self.record_failure(
-                linux_path, "File not found", "file_error"
+            logger.warning(f"File not found (permanent): {windows_path}")
+            await self._force_permanent_failure(
+                linux_path, "File does not exist on disk"
             )
             return False, 0
 
@@ -707,6 +1022,15 @@ class FaceWorker:
                                   f"[scale={scale:.0%}, model={model}]")
                     return True, faces
                 else:
+                    # Detection succeeded but DB save failed - record this
+                    await self.record_failure(
+                        linux_path,
+                        "Detection succeeded but save_face_data failed",
+                        "save_error",
+                        original_size=(result.get('width'), result.get('height')),
+                        file_size=0,
+                        attempted_scale=result.get('scale_used')
+                    )
                     return False, 0
             else:
                 # FAILURE - record for retry, do NOT save to face_metadata
@@ -716,8 +1040,9 @@ class FaceWorker:
                 file_size = result.get("file_size", 0)
                 attempted_scale = result.get("attempted_scale")
 
+                error_msg = error[:100] if error else "Unknown error"
                 logger.warning(f"Detection failed for {linux_path}: "
-                             f"[{error_type}] {error[:100]}")
+                             f"[{error_type}] {error_msg}")
 
                 await self.record_failure(
                     linux_path, error, error_type,
@@ -733,35 +1058,186 @@ class FaceWorker:
             return False, 0
 
         except Exception as e:
-            logger.error(f"Error processing {linux_path}: {e}")
+            import traceback
+            full_error = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"Error processing {linux_path}: {full_error}", exc_info=True)
             await self.record_failure(
-                linux_path, str(e), "crash"
+                linux_path, full_error, "crash",
+                original_size=None, file_size=0, attempted_scale=None
             )
             return False, 0
 
     async def process_batch(self, image_infos: List[Dict]) -> Tuple[int, int]:
-        """Process a batch of images with memory cleanup."""
+        """Process a batch of images with circuit breaker and blacklist support."""
         processed = 0
         total_faces = 0
+        batch_failures = 0
+        batch_start = time.time()
 
         for i, info in enumerate(image_infos):
             if not self.running:
+                # Record remaining images as shutdown-skipped so they don't loop forever
+                logger.info("Shutdown requested - recording remaining batch images")
+                for remaining in image_infos[i:]:
+                    try:
+                        await self.record_failure(
+                            remaining['file_path'],
+                            "Worker shutdown during batch",
+                            "shutdown"
+                        )
+                    except Exception:
+                        await self._force_permanent_failure(
+                            remaining['file_path'],
+                            "Shutdown - could not record normally"
+                        )
                 break
 
-            success, faces = await self.process_image(info)
+            image_path = info['file_path']
+
+            # DEFENSIVE: Check session blacklist
+            try:
+                if hasattr(self, 'session_blacklist') and self.session_blacklist.is_blacklisted(image_path):
+                    logger.debug(f"Skipping blacklisted image: {image_path}")
+                    # Record to DB so it doesn't keep coming back
+                    try:
+                        await self.record_failure(
+                            image_path,
+                            "Session blacklisted - repeated failures",
+                            "session_blacklist"
+                        )
+                    except Exception as e:
+                        logger.error(f"CRITICAL: Cannot record blacklist for {image_path}: {e}")
+                        # Force permanent failure to break the loop
+                        await self._force_permanent_failure(image_path, f"Blacklist record failed: {e}")
+                    batch_failures += 1
+                    continue
+            except Exception as e:
+                logger.warning(f"Blacklist check failed (continuing): {e}")
+
+            # DEFENSIVE: Check circuit breaker
+            try:
+                if hasattr(self, 'circuit_breaker') and not self.circuit_breaker.can_proceed():
+                    logger.warning(f"Circuit breaker open - waiting {CIRCUIT_BREAKER_PAUSE_SECONDS}s...")
+                    await asyncio.sleep(CIRCUIT_BREAKER_PAUSE_SECONDS)
+                    if not self.circuit_breaker.can_proceed():
+                        logger.warning("Circuit breaker still open - recording remaining images")
+                        for remaining in image_infos[i:]:
+                            try:
+                                await self.record_failure(
+                                    remaining['file_path'],
+                                    "Circuit breaker pause - batch aborted",
+                                    "circuit_breaker"
+                                )
+                            except Exception:
+                                await self._force_permanent_failure(
+                                    remaining['file_path'],
+                                    "Circuit breaker - could not record normally"
+                                )
+                        break
+            except Exception as e:
+                logger.warning(f"Circuit breaker check failed (continuing): {e}")
+
+            # Process image with exception handling to prevent crashes
+            try:
+                success, faces = await self.process_image(info)
+            except Exception as e:
+                logger.error(f"Unhandled error for {image_path}: {e}")
+                try:
+                    await self._force_permanent_failure(image_path, f"Unhandled: {e}")
+                except Exception:
+                    pass
+                success, faces = False, 0
+
             if success:
                 processed += 1
                 total_faces += faces
                 self.processed_count += 1
                 self.face_count += faces
+
+                # Clear from blacklist on success
+                try:
+                    if hasattr(self, 'session_blacklist'):
+                        self.session_blacklist.clear_on_success(image_path)
+                    if hasattr(self, 'executor_manager'):
+                        self.executor_manager.record_success()
+                except Exception:
+                    pass
             else:
+                batch_failures += 1
                 self.failure_count += 1
+
+                # Record in session blacklist
+                try:
+                    if hasattr(self, 'session_blacklist'):
+                        self.session_blacklist.record_failure(image_path)
+                except Exception:
+                    pass
+
+                # Check if executor needs restart
+                try:
+                    if hasattr(self, 'executor_manager') and self.executor_manager.record_crash():
+                        logger.info("Restarting executor after consecutive crashes...")
+                        self.executor_manager.create_executor()
+                        await asyncio.sleep(EXECUTOR_RESTART_DELAY_SECONDS)
+                except Exception as e:
+                    logger.warning(f"Executor recovery failed: {e}")
 
             # Cleanup between images
             if (i + 1) % MEMORY_CLEANUP_INTERVAL == 0:
                 cleanup_gpu_memory()
 
+        # Record batch in circuit breaker
+        try:
+            if hasattr(self, 'circuit_breaker'):
+                self.circuit_breaker.record_batch(processed, batch_failures)
+        except Exception:
+            pass
+
+        # Write health status
+        try:
+            self.write_health_status()
+        except Exception:
+            pass
+
         return processed, total_faces
+
+    def write_health_status(self):
+        """Write health status to file for external monitoring."""
+        status = {
+            "timestamp": datetime.now().isoformat(),
+            "status": "running" if self.running else "stopped",
+            "processed_count": self.processed_count,
+            "face_count": self.face_count,
+            "failure_count": self.failure_count,
+            "has_failure_table": self.has_failure_table,
+            "uptime_seconds": (datetime.now() - self.start_time).total_seconds(),
+        }
+
+        # Add circuit breaker status
+        if hasattr(self, 'circuit_breaker'):
+            status["circuit_breaker"] = self.circuit_breaker.get_status()
+
+        # Add blacklist stats
+        if hasattr(self, 'session_blacklist'):
+            status["blacklist"] = self.session_blacklist.get_stats()
+
+        # Add executor info
+        if hasattr(self, 'executor_manager'):
+            status["executor_restarts"] = self.executor_manager.total_restarts
+
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                dir=WORKER_DIR,
+                suffix='.json',
+                delete=False
+            ) as f:
+                json.dump(status, f, indent=2)
+                temp_path = f.name
+            os.replace(temp_path, HEALTH_STATUS_FILE)
+        except Exception as e:
+            logger.debug(f"Failed to write health status: {e}")
 
     async def run(self):
         """Main worker loop."""
@@ -780,11 +1256,8 @@ class FaceWorker:
 
         await self.connect()
 
-        # Create executor with single worker
-        self.executor = ProcessPoolExecutor(
-            max_workers=MAX_WORKERS,
-            initializer=init_face_worker
-        )
+        # Create executor using manager
+        self.executor_manager.create_executor()
 
         try:
             idle_count = 0
